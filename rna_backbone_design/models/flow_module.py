@@ -213,11 +213,17 @@ class FlowModule(LightningModule):
         self.interpolant.set_device(res_mask.device)
         num_batch = res_mask.shape[0]
         num_res = is_na_residue_mask.sum(dim=-1).max().item()
-        
+        random_aatype = torch.randint(
+                    low=0, high=4, 
+                    size=(num_batch, num_res), 
+                    device=self.device
+                )      
+
         samples = self.interpolant.sample(
             num_batch,
             num_res,
             self.model,
+            aatype=random_aatype,
         )[0][-1].numpy()
 
         batch_metrics = []
@@ -358,6 +364,7 @@ class FlowModule(LightningModule):
         interpolant.set_device(device)
 
         sample_length = batch['num_res'].item()
+
         diffuse_mask = torch.ones(1, sample_length).long().unsqueeze(0)
         sample_id = batch['sample_id'].item()
         sample_dir = os.path.join(self._output_dir, f'length_{sample_length}')

@@ -13,7 +13,7 @@ from rna_backbone_design.models import torsion_net
 from rna_backbone_design.data import utils as du
 from rna_backbone_design.models.ipa_pytorch import InvariantPointAttention, StructureModuleTransition, BackboneUpdate, EdgeTransition, Linear
 from rna_backbone_design.models.edge_embedder import EdgeEmbedder
-
+import fm
 from flash_ipa.utils import check_config_ipa
 from flash_ipa.edge_embedder import EdgeEmbedder as FlashEdgeEmbedder
 from flash_ipa.ipa import InvariantPointAttention as FlashInvariantPointAttention, StructureModuleTransition as FlashStructureModuleTransition, BackboneUpdate as FlashBackboneUpdate, EdgeTransition as FlashEdgeTransition
@@ -28,6 +28,17 @@ class FlowModel(nn.Module):
         self.rigids_ang_to_nm = lambda x: x.apply_trans_fn(lambda x: x * du.ANG_TO_NM_SCALE)
         self.rigids_nm_to_ang = lambda x: x.apply_trans_fn(lambda x: x * du.NM_TO_ANG_SCALE) 
         self.node_embedder = NodeEmbedder(model_conf.node_features)
+
+        self.c_s = self._ipa_conf.c_s  
+        self.aatype_embedding = nn.Embedding(32, self.c_s)
+        self.rna_fm_dim = 640
+        self.rna_fm_proj = nn.Linear(self.rna_fm_dim, self.c_s)
+        print("Initializing RNA-FM model for inference...")
+        self.rna_fm_model, self.rna_fm_alphabet = fm.pretrained.rna_fm_t12()
+        self.rna_fm_batch_converter = self.rna_fm_alphabet.get_batch_converter()
+        for param in self.rna_fm_model.parameters():
+            param.requires_grad = False
+        self.rna_fm_model.eval()
 
         self.use_flashipa = model_conf.use_flashipa
         if self.use_flashipa:
@@ -93,11 +104,45 @@ class FlowModel(nn.Module):
         # hparams taken from OpenFold's config.py
         self.angle_pred_net = torsion_net.TorsionAngleHead(c_in=self._ipa_conf.c_s, c_hidden=128, no_blocks=2, no_angles=NUM_NA_TORSIONS, epsilon=1e-12)
 
+    def _run_rna_fm_on_the_fly(self, aatype):
+            device = aatype.device
+            
+            # 确保 RNA-FM 模型在正确的设备上
+            if next(self.rna_fm_model.parameters()).device != device:
+                self.rna_fm_model.to(device)
+
+            # 映射表：包含标准索引 (0-3) 和推理时可能的随机索引 (25-28)
+            # 0:A, 1:C, 2:G, 3:U, 25:A, 26:C, 27:G, 28:U
+            mapping = {0:'A', 1:'C', 2:'G', 3:'U', 
+                    25:'A', 26:'C', 27:'G', 28:'U'} 
+            
+            data_list = []
+            for i in range(aatype.shape[0]):
+                # 转换为序列字符串，未知字符用 'N'
+                seq = "".join([mapping.get(int(x), 'N') for x in aatype[i].cpu().numpy()])
+                data_list.append((f"seq_{i}", seq))
+
+            # 运行 RNA-FM
+            _, _, batch_tokens = self.rna_fm_batch_converter(data_list)
+            batch_tokens = batch_tokens.to(device)
+            
+            with torch.no_grad():
+                results = self.rna_fm_model(batch_tokens, repr_layers=[12])
+                token_emb = results["representations"][12] # [B, L+2, 640]
+
+            # 裁剪 <cls> 和 <eos> (索引 1 到 -1)
+            # 假设 Batch 内长度一致，或者由后续 Mask 处理
+            seq_len = aatype.shape[1]
+            return token_emb[:, 1:seq_len+1, :]
+
     def forward(self, input_feats):
         node_mask = input_feats['res_mask']
         continuous_t = input_feats['t']
         trans_t = input_feats['trans_t']
         rotmats_t = input_feats['rotmats_t']
+
+        aatype = input_feats['aatype'].long()
+
         if 'trans_sc' not in input_feats:
             trans_sc = torch.zeros_like(trans_t)
         else:
@@ -105,7 +150,16 @@ class FlowModel(nn.Module):
 
         # Initialize node and edge embeddings
         init_node_embed = self.node_embedder(continuous_t, node_mask)
-        init_node_embed = init_node_embed * node_mask[..., None]
+
+        direct_emb = self.aatype_embedding(aatype) # [Batch, Length, c_s]
+        if 'rna_fm_features' in input_feats and input_feats['rna_fm_features'].abs().sum() > 0:
+            fm_raw = input_feats['rna_fm_features']      
+        else:
+            fm_raw = self._run_rna_fm_on_the_fly(aatype)
+        fm_emb = self.rna_fm_proj(fm_raw)    
+        fused_node_embed = init_node_embed + direct_emb + fm_emb
+        node_embed = fused_node_embed * node_mask[..., None]
+        init_node_embed = node_embed
         node_embed = init_node_embed * node_mask[..., None]
 
         # Compute edge embeddings from node embeddings and translations

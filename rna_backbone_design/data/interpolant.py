@@ -192,8 +192,12 @@ class Interpolant:
         trans_0 = _centered_gaussian(num_batch, num_res, self._device) * du.NM_TO_ANG_SCALE
         rotmats_0 = _uniform_so3(num_batch, num_res, self._device)
         
+        if aatype is None:
+            aatype = torch.zeros(num_batch, num_res, device=self._device).long()
+            
         batch = {
             'res_mask': res_mask,
+            'aatype': aatype
         }
 
         # get diffusion timesteps in order between [0, 1]

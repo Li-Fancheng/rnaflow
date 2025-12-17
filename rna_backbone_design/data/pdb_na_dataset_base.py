@@ -5,7 +5,7 @@
 import functools as fn
 import numpy as np
 import pandas as pd
-
+import os
 import torch, tree
 from beartype.typing import Optional
 from omegaconf import DictConfig
@@ -29,6 +29,7 @@ class PDBNABaseDataset(Dataset):
         self._is_training = is_training
         self._filter_eval_split = filter_eval_split
         self._inference_cfg = inference_cfg
+        self.rna_fm_cache_dir = "data/rna_fm_embeddings"
         self._init_metadata_and_splits()
 
     @property
@@ -182,7 +183,8 @@ class PDBNABaseDataset(Dataset):
         # cleaner version
         final_feats = {
             "torsion_angles_sin_cos": chain_feats["torsion_angles_sin_cos"],
-            "is_na_residue_mask": processed_feats["is_na_residue_mask"]
+            "is_na_residue_mask": processed_feats["is_na_residue_mask"],
+            "aatype": chain_feats["aatype"]
         }
 
         rigids_1 = rigid_utils.Rigid.from_tensor_4x4(
@@ -202,6 +204,7 @@ class PDBNABaseDataset(Dataset):
             - trans_1
             - res_mask
             - is_na_residue_mask
+            - aatype
         """
 
         return final_feats
@@ -221,8 +224,15 @@ class PDBNABaseDataset(Dataset):
         example_idx = idx
         csv_row = self.csv.iloc[example_idx]
         processed_file_path = csv_row["processed_path"]
-        final_feats = self._process_csv_row(processed_file_path) # get the features for this instance
-
+        final_feats = self._process_csv_row(processed_file_path).copy()
+        pdb_name = csv_row['pdb_name']
+        cache_path = os.path.join(self.rna_fm_cache_dir, f"{pdb_name}.pt")
+        if os.path.exists(cache_path):
+            rna_fm_emb = torch.load(cache_path, weights_only=True)
+        else:
+            seq_len = final_feats['aatype'].shape[0]
+            rna_fm_emb = torch.zeros(seq_len, 640)
+        final_feats['rna_fm_features'] = rna_fm_emb
         # Convert all features to tensors.
         final_feats = tree.map_structure(
             lambda x: x if torch.is_tensor(x) else torch.tensor(x), final_feats
