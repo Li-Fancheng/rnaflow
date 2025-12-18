@@ -35,7 +35,7 @@ model:
   edge_embed_size: 128
   symmetric: False
   node_features:
-    c_s: ${model.node_embed_size}
+    c_s: ${model.node_embed_size}  
     c_pos_emb: 128
     c_timestep_emb: 128
     embed_diffuse_mask: False
